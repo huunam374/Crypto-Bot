@@ -9,7 +9,7 @@ import time
 
 # ⚠️ THAY ĐỔI 2 DÒNG NÀY
 GITHUB_REPO = "huunam374/Crypto-Bot" # Ví dụ: "nguyenvana/cryptobot"
-CURRENT_VERSION = "1.0.0" # Sẽ được đọc từ version.txt
+CURRENT_VERSION = "1.0.2" # Sẽ được đọc từ version.txt
 
 def get_latest_release():
     url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"

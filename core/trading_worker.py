@@ -237,7 +237,7 @@ class TradingWorker(QThread):
             try:
                 self._scan_once()
 
-                if time.time() - last_sync_time > 300:
+                if time.time() - last_sync_time > 60:
                     self.log_signal.emit("INFO", f"[{self.cfg.market_type}] Đang tự động đồng bộ lệnh thủ công từ sàn...")
                     self._sync_positions_with_exchange()
                     last_sync_time = time.time()
@@ -326,10 +326,26 @@ class TradingWorker(QThread):
                         "sl": sl_val,
                         "interval": self.cfg.interval,
                     })
-
             except Exception as inner_e:
                 self.log_signal.emit("WARN", f"Bỏ qua {pos.get('symbol', 'Unknown')}: {inner_e}")
                 continue
+
+        try:
+            all_orders = self.binance.client.futures_get_open_orders()
+            active_symbols = {p['symbol'] for p in active_positions}
+            orphan_orders = [o for o in all_orders if o['symbol'] not in active_symbols]
+            
+            for o in orphan_orders:
+                sym = o['symbol']
+                try:
+                    self.binance.client.futures_cancel_order(symbol=sym, orderId=o['orderId'])
+                    self.log_signal.emit("INFO", f"[Dọn rác] Đã hủy lệnh mồ côi {sym} (orderId={o['orderId']})")
+                except Exception as e:
+                    self.log_signal.emit("WARN", f"Không hủy được lệnh mồ côi {sym}: {e}")
+        except Exception as e:
+            self.log_signal.emit("WARN", f"Lỗi dọn lệnh mồ côi: {e}")
+        # ✅ KẾT THÚC ĐOẠN CODE MỚI
+
 
     def _place_missing_sl_tp(self, symbol: str, entry_price: float, direction: str, qty_abs: float):
         """Chỉ dùng 1 lần khi sync thấy lệnh mở mà trên sàn ko có SL/TP"""
@@ -529,8 +545,11 @@ class TradingWorker(QThread):
                 final_pnl = coin_data.get("last_pnl", 0.0)
                 old_dir = coin_data.get("direction")
                 self.log_signal.emit("WARN", f"{symbol}: Lệnh {old_dir} đã đóng hoàn toàn. Xóa khỏi danh sách.")
-                try: self.binance.cancel_open_orders(symbol)
-                except: pass
+                
+                ok = self.binance.cancel_open_orders(symbol)
+                if not ok:
+                    self.log_signal.emit("ERROR", f"{symbol}: KHÔNG dọn được lệnh mềm! Kiểm tra tay trên sàn.")
+
                 self.trade_closed_signal.emit(symbol, old_dir, {"pnl": final_pnl, "entry": coin_data.get("entry", 0.0)})
                 with self._lock:
                     if symbol in self.watchlist: del self.watchlist[symbol]

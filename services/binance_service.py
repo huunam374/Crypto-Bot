@@ -397,19 +397,34 @@ class BinanceDataService:
             log.error(f"Lỗi lấy PnL {symbol}: {e}")
         return {"pnl_usdt": 0, "pnl_pct": 0}
 
-    def cancel_open_orders(self, symbol: str):
-        try:
-            if self.cfg.market_type == "FUTURE":
-                orders = self.client.futures_get_open_orders(symbol=symbol)
-                if orders:
+    def cancel_open_orders(self, symbol: str, retry: int = 2):
+        """Hủy toàn bộ lệnh mềm, có retry và log rõ ràng."""
+        for attempt in range(retry):
+            try:
+                if self.cfg.market_type == "FUTURE":
+                    orders = self.client.futures_get_open_orders(symbol=symbol)
+                    if not orders:
+                        return True  # Không có gì để hủy
                     self.client.futures_cancel_all_open_orders(symbol=symbol)
-                    # ✅ FIX: giảm sleep 0.2→0.1
                     time.sleep(0.1)
-            else:
-                open_orders = self.client.get_open_orders(symbol=symbol)
-                for order in open_orders:
-                    self.client.cancel_order(symbol=symbol, orderId=order['orderId'])
-        except Exception as e:
-            log.error(f"Lỗi hủy lệnh {symbol}: {e}")
+                    # Verify lại
+                    remain = self.client.futures_get_open_orders(symbol=symbol)
+                    if not remain:
+                        return True
+                    log.warning(f"[{symbol}] Còn {len(remain)} lệnh mềm sau khi hủy, retry {attempt+1}")
+                else:
+                    open_orders = self.client.get_open_orders(symbol=symbol)
+                    for order in open_orders:
+                        try:
+                            self.client.cancel_order(symbol=symbol, orderId=order['orderId'])
+                        except Exception as e:
+                            log.warning(f"Không hủy được order {order['orderId']}: {e}")
+                    return True
+            except Exception as e:
+                log.error(f"Lỗi hủy lệnh {symbol} lần {attempt+1}: {e}")
+                time.sleep(0.3)
+        log.error(f"[{symbol}] THẤT BẠI hủy lệnh mềm sau {retry} lần!")
+        return False
+
 
 

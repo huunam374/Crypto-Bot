@@ -710,40 +710,54 @@ class MainWindow(QMainWindow):
 
             self.plot_widget.setTitle(f"<span style='color:#e2e8f0;font-size:14px;'>{symbol} - {interval} (Giá: {current_price:,.4f})</span>")
 
-            if hasattr(self, 'active_trades') and symbol in self.active_trades:
-                trade = self.active_trades[symbol]
-                entry = trade.get("entry", 0)
-                tp = trade.get("tp", 0)
-                sl = trade.get("sl", 0)
-                direction = trade.get("direction", "BUY")
+            # ✅ VẼ SL/TP LÊN ĐỒ THỊ (Tự động cập nhật theo lệnh đang chạy)
+            try:
+                active_plan = None
+                # 1. Tìm xem lệnh này đang được quản lý bởi Bot Spot hay Future
+                if self.worker_spot and symbol in self.worker_spot.watchlist:
+                    active_plan = self.worker_spot.watchlist[symbol]
+                elif self.worker_future and symbol in self.worker_future.watchlist:
+                    active_plan = self.worker_future.watchlist[symbol]
 
-                if isinstance(entry, (int, float)) and entry > 0:
-                    color = '#3b82f6' if direction == 'BUY' else '#f97316'
-                    self.plot_widget.addItem(pg.InfiniteLine(pos=entry, angle=0, pen=pg.mkPen(color, style=Qt.PenStyle.DashLine, width=2)))
-                                
-                # ✅ Vẽ TP1 (xanh nhạt, nét nhỏ) — nằm giữa
-                tp1 = trade.get("tp1", 0)
-                if isinstance(tp1, (int, float)) and tp1 > 0:
-                    self.plot_widget.addItem(pg.InfiniteLine(
-                        pos=tp1, angle=0,
-                        pen=pg.mkPen('#86efac', style=Qt.PenStyle.DashLine, width=1.5)
-                    ))
-                    tp1_label = pg.TextItem(f"TP1 {tp1:,.4f}", color='#181a20', fill='#86efac', anchor=(0, 0.5))
-                    tp1_label.setPos(len(data) + 2, tp1)
-                    self.plot_widget.addItem(tp1_label)
+                # 2. Nếu lệnh đang mở và có SL/TP, vẽ lên biểu đồ
+                if active_plan and active_plan.get("direction") in ["BUY", "SELL"]:
+                    entry = active_plan.get("entry", 0)
+                    tp = active_plan.get("tp", 0)
+                    sl = active_plan.get("sl", 0)
+                    direction = active_plan.get("direction", "BUY")
 
-                # ✅ Vẽ TP2 (xanh đậm, nét đậm) — điểm chốt cuối
-                if isinstance(tp, (int, float)) and tp > 0:
-                    self.plot_widget.addItem(pg.InfiniteLine(
-                        pos=tp, angle=0,
-                        pen=pg.mkPen('#22c55e', style=Qt.PenStyle.DashLine, width=2)
-                    ))
-                    tp2_label = pg.TextItem(f"TP2 {tp:,.4f}", color='#181a20', fill='#22c55e', anchor=(0, 0.5))
-                    tp2_label.setPos(len(data) + 2, tp)
-                    self.plot_widget.addItem(tp2_label)
-                
-                if isinstance(sl, (int, float)) and sl > 0:
-                    self.plot_widget.addItem(pg.InfiniteLine(pos=sl, angle=0, pen=pg.mkPen('#ef4444', style=Qt.PenStyle.DashLine, width=2)))
+                    # Vẽ đường Entry (Màu xanh dương nếu BUY, cam nếu SELL)
+                    if isinstance(entry, (int, float)) and entry > 0:
+                        color = '#3b82f6' if direction == 'BUY' else '#f97316'
+                        self.plot_widget.addItem(pg.InfiniteLine(
+                            pos=entry, angle=0, 
+                            pen=pg.mkPen(color, style=Qt.PenStyle.DashLine, width=2)
+                        ))
+                        entry_label = pg.TextItem(f"Entry {entry:,.4f}", color='#181a20', fill=color, anchor=(1, 1))
+                        entry_label.setPos(len(data) - 5, entry)
+                        self.plot_widget.addItem(entry_label)
+
+                    # Vẽ đường TP (Màu xanh lá, nét đứt)
+                    if isinstance(tp, (int, float)) and tp > 0:
+                        self.plot_widget.addItem(pg.InfiniteLine(
+                            pos=tp, angle=0, 
+                            pen=pg.mkPen('#22c55e', style=Qt.PenStyle.DashLine, width=2)
+                        ))
+                        tp_label = pg.TextItem(f"TP {tp:,.4f}", color='#181a20', fill='#22c55e', anchor=(1, 1))
+                        tp_label.setPos(len(data) - 5, tp)
+                        self.plot_widget.addItem(tp_label)
+
+                    # Vẽ đường SL (Màu đỏ, nét đứt)
+                    if isinstance(sl, (int, float)) and sl > 0:
+                        self.plot_widget.addItem(pg.InfiniteLine(
+                            pos=sl, angle=0, 
+                            pen=pg.mkPen('#ef4444', style=Qt.PenStyle.DashLine, width=2)
+                        ))
+                        sl_label = pg.TextItem(f"SL {sl:,.4f}", color='#181a20', fill='#ef4444', anchor=(1, 1))
+                        sl_label.setPos(len(data) - 5, sl)
+                        self.plot_widget.addItem(sl_label)
+            except Exception as e:
+                log.error(f"Lỗi vẽ SL/TP lên chart: {e}")
 
             padding_y = (max_price - min_price) * 0.1
             if padding_y == 0: padding_y = max_price * 0.001

@@ -35,6 +35,7 @@ class TechnicalIndicatorCalculator:
         out["clv"] = ((out["close"] - out["low"]) - (out["high"] - out["close"])) / hl_range.replace(0, 1e-9)
         out["atr"] = ta.atr(out["high"], out["low"], out["close"], length=14)
         out["rsi"] = ta.rsi(out["close"], length=14)
+        out["mfi"] = ta.mfi(out["high"], out["low"], out["close"], out["volume"], length=14)
         out = TechnicalIndicatorCalculator.calculate_cvd(out)
         return out
 
@@ -85,7 +86,7 @@ class TechnicalIndicatorCalculator:
         smc_bypass = getattr(cfg, 'smc_bypass_bb_zone', True) if cfg else True
         pullback_vol_min = getattr(cfg, 'pullback_vol_min_ratio', 0.4) if cfg else 0.4
 
-        # ✅ FIX LỖI VÀNG: Khởi tạo tường minh các biến SMC từ đầu
+        # ✅ Khởi tạo tường minh các biến SMC từ đầu
         sweep = "NONE"
         fvg = {"bullish": None, "bearish": None}
         smc_confirms = False
@@ -106,7 +107,7 @@ class TechnicalIndicatorCalculator:
                 if fvg_top >= last["close"] >= fvg_bot - (atr * 0.5): smc_confirms = True
 
         # =====================================================================
-        # ✅ 1. BỘ LỌC HÀNH VI GIÁ (ANTI-FOMO & VSA) - MỚI
+        # ✅ 1. BỘ LỌC HÀNH VI GIÁ NÂNG CAO (ANTI-FOMO + VOLUME + CVD)
         # =====================================================================
         body_size = abs(last["close"] - last["open"])
         candle_range = last["high"] - last["low"]
@@ -115,16 +116,38 @@ class TechnicalIndicatorCalculator:
         lower_wick = min(last["open"], last["close"]) - last["low"]
         upper_wick = last["high"] - max(last["open"], last["close"])
 
-        # Chặn bắt dao rơi (Râu quá dài)
-        if direction == "SELL" and lower_wick > body_size * 2.0:
-            return 0 
-        if direction == "BUY" and upper_wick > body_size * 2.0:
-            return 0
+        # Lấy Volume và CVD hiện tại (real-time)
+        current_vol_ratio = last["vol_ratio"]
+        cvd_slope = last["cvd"] - prev["cvd"]  # Dòng tiền trong 1 nến
+
+        # --- LỚP 1 & 2: Chỉ kiểm tra râu khi nến đã "thành hình" (body > 10%) ---
+        if body_ratio > 0.1:
+            # Bắt bẫy Bear Trap (Râu dưới dài) - CHẶN CỨNG SELL
+            if direction == "SELL" and lower_wick > body_size * 2.0:
+                # Râu dưới dài + Volume cạn kiệt HOẶC CVD đang tăng => Bẫy quét thanh khoản
+                if current_vol_ratio < 0.8 or cvd_slope > 0:
+                    return 0
+                
+            # Bắt bẫy Bull Trap (Râu trên dài) - CHẶN CỨNG BUY
+            if direction == "BUY" and upper_wick > body_size * 2.0:
+                # Râu trên dài + Volume cạn kiệt HOẶC CVD đang giảm => Bẫy dụ Long
+                if current_vol_ratio < 0.8 or cvd_slope < 0:
+                    return 0
 
         # Chặn đỉnh/đáy Climax (Volume cực to nhưng thân ngắn)
         if last["vol_ratio"] > 3.0 and body_ratio < 0.4:
             if direction == "SELL" and last["rsi"] < 30: return 0
             if direction == "BUY" and last["rsi"] > 70: return 0
+
+        # --- LỚP 3: Trừ điểm nhẹ nếu có dấu hiệu Phân phối/Gom hàng (Không chặn cứng) ---
+        # Giá tăng, Vol lớn nhưng CVD âm => Đang xả hàng (Distribution)
+        if direction == "BUY" and last["close"] > last["open"] and cvd_slope < 0 and current_vol_ratio > 1.5:
+            score_penalty = 15
+        # Giá giảm, Vol lớn nhưng CVD dương => Đang gom hàng (Accumulation)
+        elif direction == "SELL" and last["close"] < last["open"] and cvd_slope > 0 and current_vol_ratio > 1.5:
+            score_penalty = 15
+        else:
+            score_penalty = 0
 
         # =====================================================================
         # ✅ 2. BỘ LỌC VOLUME CƠ BẢN
@@ -155,29 +178,32 @@ class TechnicalIndicatorCalculator:
             elif direction == "BUY" and is_walking_up and last["vol_ratio"] > 1.5:
                 pass # Cho phép đánh tiếp sóng thần tăng
             elif 0.35 <= bb_pos <= 0.65:
-                # ✅ SỬA TẠI ĐÂY: Chỉ chặn nếu KHÔNG PHẢI là chiến lược PULLBACK
-                # Nếu là PULLBACK, cho phép đi tiếp vào phần chấm điểm
+                # Chỉ chặn nếu KHÔNG PHẢI là chiến lược PULLBACK hoặc BREAKOUT
                 if strategy != "PULLBACK" and strategy != "BREAKOUT":
                     if not (smc_bypass and smc_confirms):
-                        return 0 # Chặn vùng nhiễu giữa BB đối với các chiến lược khác
+                        return 0
 
         # =====================================================================
-        # 4. CHẤM ĐIỂM KỸ THUẬT (Tích hợp Squeeze)
+        # 4. CHẤM ĐIỂM KỸ THUẬT (Tích hợp Squeeze & MFI)
         # =====================================================================
         score = 0
         dragon_spread = abs(last["ema34"] - last["ema89"]) / last["close"]
-
-        # Kiểm tra Bollinger Squeeze (Độ rộng BB nhỏ hơn 80% MA20 của nó)
         is_squeeze = last["bb_width"] < last["bb_width_ma"] * 0.8 if "bb_width_ma" in last else False
+        
+        # Lấy MFI an toàn (tránh lỗi nếu cột chưa tồn tại)
+        mfi_curr = last.get("mfi", 50)
+        mfi_prev = prev.get("mfi", 50)
 
         if strategy == "BREAKOUT":
             if direction == "BUY":
                 if last["ema34"] > last["ema89"]: score += 15
                 if dragon_spread > 0.008: score += 15
-                if is_squeeze: score += 20 # Điểm cao cho Squeeze
+                if is_squeeze: score += 20
                 if last["close"] > last["bb_upper"] and body_ratio > 0.7: score += 20
-                if last["vol_ratio"] > 1.5 and body_ratio > 0.6: score += 20 # Effort vs Result
+                if last["vol_ratio"] > 1.5 and body_ratio > 0.6: score += 20
                 if last["obv"] > prev["obv"]: score += 10
+                # ✅ MFI xác nhận dòng tiền tăng
+                if mfi_curr > 50 and mfi_curr > mfi_prev: score += 10
             else:
                 if last["ema34"] < last["ema89"]: score += 15
                 if dragon_spread > 0.008: score += 15
@@ -185,54 +211,71 @@ class TechnicalIndicatorCalculator:
                 if last["close"] < last["bb_lower"] and body_ratio > 0.7: score += 20
                 if last["vol_ratio"] > 1.5 and body_ratio > 0.6: score += 20
                 if last["obv"] < prev["obv"]: score += 10
+                # ✅ MFI xác nhận dòng tiền giảm
+                if mfi_curr < 50 and mfi_curr < mfi_prev: score += 10
                 
         elif strategy == "PULLBACK":
             if direction == "BUY":
                 if last["ema34"] > last["ema89"]: score += 15
                 if lower_wick > body_size * 1.5 and last["close"] > last["open"]: score += 25
                 if last["low"] <= last["ema34"] and last["close"] > last["ema34"]: score += 20
-                if last["vol_ratio"] < 1.2: score += 15 # Volume cạn kiệt
+                if last["vol_ratio"] < 1.2: score += 15
                 if last["rsi"] < 45 and last["rsi"] > prev["rsi"]: score += 15
+                # ✅ MFI thoát vùng quá bán
+                if mfi_curr < 40 and mfi_curr > mfi_prev: score += 10
             else:
                 if last["ema34"] < last["ema89"]: score += 15
                 if upper_wick > body_size * 1.5 and last["close"] < last["open"]: score += 25
                 if last["high"] >= last["ema34"] and last["close"] < last["ema34"]: score += 20
                 if last["vol_ratio"] < 1.2: score += 15
                 if last["rsi"] > 55 and last["rsi"] < prev["rsi"]: score += 15
+                # ✅ MFI thoát vùng quá mua
+                if mfi_curr > 60 and mfi_curr < mfi_prev: score += 10
                 
         elif strategy == "RANGING":
             if direction == "BUY":
                 if last["close"] <= last["bb_lower"] * 1.002: score += 30
                 if last["rsi"] < 30: score += 20
                 if last["clv"] > 0.6 and last["close"] > last["open"]: score += 20
+                # ✅ MFI quá bán và đang quay đầu
+                if mfi_curr < 30 and mfi_curr > mfi_prev: score += 15
             else:
                 if last["close"] >= last["bb_upper"] * 0.998: score += 30
                 if last["rsi"] > 70: score += 20
                 if last["clv"] < -0.6 and last["close"] < last["open"]: score += 20
+                # ✅ MFI quá mua và đang quay đầu
+                if mfi_curr > 70 and mfi_curr < mfi_prev: score += 15
 
         # =====================================================================
-        # 5. SMC BONUS (Giữ nguyên)
+        # 5. SMC BONUS (Đã nâng cấp: Có điều kiện RSI để tránh bắt đỉnh/đáy)
         # =====================================================================
         if enable_smc:
             sweep_bonus = cfg.smc_sweep_bonus if cfg else 15
-            if direction == "BUY" and sweep == "BULLISH": score += sweep_bonus
-            elif direction == "SELL" and sweep == "BEARISH": score += sweep_bonus
+            if direction == "BUY" and sweep == "BULLISH" and last["rsi"] > 30: 
+                score += sweep_bonus
+            elif direction == "SELL" and sweep == "BEARISH" and last["rsi"] < 70:
+                score += sweep_bonus
 
             fvg_bonus = cfg.smc_fvg_bonus if cfg else 10
             atr = last["atr"] if not pd.isna(last["atr"]) else last["close"] * 0.02
             if direction == "BUY" and fvg["bullish"]:
                 fvg_bot, fvg_top = fvg["bullish"]["bottom"], fvg["bullish"]["top"]
-                if fvg_bot <= last["close"] <= fvg_top + (atr * 0.5): score += fvg_bonus
+                if fvg_bot <= last["close"] <= fvg_top + (atr * 0.5) and last["rsi"] > 30: 
+                    score += fvg_bonus
             elif direction == "SELL" and fvg["bearish"]:
                 fvg_bot, fvg_top = fvg["bearish"]["bottom"], fvg["bearish"]["top"]
-                if fvg_top >= last["close"] >= fvg_bot - (atr * 0.5): score += fvg_bonus
+                if fvg_top >= last["close"] >= fvg_bot - (atr * 0.5) and last["rsi"] < 70: 
+                    score += fvg_bonus
 
         if bb_range > 0:
             bb_pos = (last["close"] - last["bb_lower"]) / bb_range
             if 0.35 <= bb_pos <= 0.65 and strategy != "BREAKOUT" and smc_confirms:
                 score -= 10
 
-        return score
+        # ✅ ÁP DỤNG HÌNH PHẠT (PENALTY) TỪ BỘ LỌC CVD
+        score -= score_penalty
+
+        return max(0, score)  # Đảm bảo điểm không bao giờ âm
 
     @staticmethod
     def check_fvg(df: pd.DataFrame, lookback: int = 20) -> dict:
@@ -264,14 +307,19 @@ class TechnicalIndicatorCalculator:
         recent_low = hist["low"].min()
         recent_high = hist["high"].max()
         
-        if (last["low"] < recent_low and last["close"] > recent_low) or \
-           (prev["low"] < recent_low and prev["close"] > recent_low):
-            return "BULLISH"
-            
-        if (last["high"] > recent_high and last["close"] < recent_high) or \
-           (prev["high"] > recent_high and prev["close"] < recent_high):
-            return "BEARISH"
-            
+        # ✅ NÂNG CẤP: Volume của nến quét phải lớn hơn MA20 (ít nhất 1.2 lần)
+        # Nếu volume nhỏ, đó chỉ là nhiễu, không phải Smart Money quét
+        vol_confirm = last["vol_ratio"] > 1.2 or prev["vol_ratio"] > 1.2
+
+        if vol_confirm:
+            if (last["low"] < recent_low and last["close"] > recent_low) or \
+               (prev["low"] < recent_low and prev["close"] > recent_low):
+                return "BULLISH"
+                
+            if (last["high"] > recent_high and last["close"] < recent_high) or \
+               (prev["high"] > recent_high and prev["close"] < recent_high):
+                return "BEARISH"
+                
         return "NONE"
 
     @staticmethod
@@ -286,19 +334,15 @@ class TechnicalIndicatorCalculator:
         atr = last["atr"] if not pd.isna(last["atr"]) else entry_price * 0.02
 
         # =====================================================================
-        # ✅ 1. TÍNH SL THEO CẤU TRÚC 100 NẾN QUÁ KHỨ (Thay thế Bollinger)
+        # ✅ 1. TÍNH SL THEO CẤU TRÚC 100 NẾN QUÁ KHỨ (Giữ nguyên)
         # =====================================================================
-        # Lấy đỉnh/đáy của 100 nến gần nhất để tìm vùng cấu trúc vĩ mô
         recent_high_100 = df["high"].tail(100).max()
         recent_low_100 = df["low"].tail(100).min()
         
-        # Lấy đỉnh/đáy của nến tín hiệu (hiện tại)
         sl_struct_last = last["low"] if direction == "BUY" else last["high"]
 
         if direction == "BUY":
-            # So sánh đáy nến hiện tại với đáy 100 nến để chọn cái THẤP HƠN (an toàn hơn)
             sl_base = min(recent_low_100, sl_struct_last)
-            # Cộng thêm đệm ATR để tránh quét râu
             sl_price = sl_base - (0.2 * atr)
             
             max_sl = entry_price * (1 - SL_MAX_PCT)
@@ -310,9 +354,7 @@ class TechnicalIndicatorCalculator:
             if risk <= 0: risk = entry_price * SL_MIN_PCT; sl_price = entry_price - risk
 
         else: # SELL
-            # So sánh đỉnh nến hiện tại với đỉnh 100 nến để chọn cái CAO HƠN (an toàn hơn)
             sl_base = max(recent_high_100, sl_struct_last)
-            # Cộng thêm đệm ATR
             sl_price = sl_base + (0.2 * atr)
             
             max_sl = entry_price * (1 + SL_MAX_PCT)
@@ -324,24 +366,34 @@ class TechnicalIndicatorCalculator:
             if risk <= 0: risk = entry_price * SL_MIN_PCT; sl_price = entry_price + risk
 
         # =====================================================================
-        # ✅ 2. TÍNH TP THEO ĐỈNH/ĐÁY 200 NẾN + ATR (Giữ nguyên phần đã sửa)
+        # ✅ 2. TÍNH TP THEO 100 VÀ 200 NẾN (So sánh lấy cái gần) + LÙI ĐỆM
         # =====================================================================
-        macro_high = df["high"].tail(200).max()
-        macro_low = df["low"].tail(200).min()
+        macro_high_200 = df["high"].tail(200).max()
+        macro_low_200 = df["low"].tail(200).min()
         atr_safe_distance = atr * 2.5 
+        
+        # Khoảng đệm để lùi TP lại (tránh chạm đúng đỉnh/đáy cũ)
+        tp_buffer = 0.2 * atr 
 
         if direction == "BUY":
-            tp_macro = macro_high * 0.995
-            if (tp_macro - entry_price) < atr_safe_distance:
+            # So sánh đỉnh 100 nến và 200 nến, lấy cái THẤP HƠN (gần hơn)
+            tp_macro = min(recent_high_100, macro_high_200)
+            # Lùi lại một khoảng đệm
+            tp_price = tp_macro - tp_buffer
+            
+            # Nếu TP quá sát (dưới 2.5 ATR), đẩy ra xa bằng BB upper hoặc ATR
+            if (tp_price - entry_price) < atr_safe_distance:
                 tp_price = max(last["bb_upper"] * 0.998, entry_price + atr_safe_distance)
-            else:
-                tp_price = tp_macro
-        else: 
-            tp_macro = macro_low * 1.005
-            if (entry_price - tp_macro) < atr_safe_distance:
+                
+        else: # SELL
+            # So sánh đáy 100 nến và 200 nến, lấy cái CAO HƠN (gần hơn)
+            tp_macro = max(recent_low_100, macro_low_200)
+            # Lùi lại một khoảng đệm (cộng lên)
+            tp_price = tp_macro + tp_buffer
+            
+            # Nếu TP quá sát (dưới 2.5 ATR), đẩy ra xa bằng BB lower hoặc ATR
+            if (entry_price - tp_price) < atr_safe_distance:
                 tp_price = min(last["bb_lower"] * 1.002, entry_price - atr_safe_distance)
-            else:
-                tp_price = tp_macro
 
         return {
             "entry": entry_price, "stop_price": sl_price, "stop_limit": sl_price,
