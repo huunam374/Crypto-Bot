@@ -1,0 +1,5 @@
+PyQt6>=6.5.0
+python-binance>=1.0.19
+pandas>=2.0.0
+pandas-ta-classic
+requests>=2.31.0
