@@ -591,21 +591,36 @@ class TradingWorker(QThread):
             buy_score, sell_score, used_strategy = 0, 0, ""
             base_min = self.cfg.min_signal_score
 
+            # ================================================================
+            # ✅ LOGIC ĐA KHUNG (MTF MATRIX) - ĐÃ NÂNG CẤP
+            # ================================================================
             if regime_htf == "UPTREND":
                 if regime_ltf == "UPTREND":
                     score = TechnicalIndicatorCalculator.get_signal_score(df, "BREAKOUT", "BUY", self.cfg)
                     if score >= max(base_min + 10, 70): buy_score, used_strategy = score, "BREAKOUT"
                 elif regime_ltf == "DOWNTREND":
+                    # Khung lớn tăng, khung nhỏ giảm (Hồi xuống) -> Chỉ mua khi có xác nhận
                     score = TechnicalIndicatorCalculator.get_signal_score(df, "PULLBACK", "BUY", self.cfg)
-                    if score >= base_min: buy_score, used_strategy = score, "PULLBACK"
+                    last_candle = df.iloc[-1]
+                    body = abs(last_candle["close"] - last_candle["open"])
+                    lower_wick = min(last_candle["open"], last_candle["close"]) - last_candle["low"]
+                    is_confirmed = (lower_wick > body * 1.5) or (last_candle["rsi"] < 35)
+                    if score >= base_min and is_confirmed: 
+                        buy_score, used_strategy = score, "PULLBACK"
 
             elif regime_htf == "DOWNTREND" and self.cfg.market_type == "FUTURE":
                 if regime_ltf == "DOWNTREND":
                     score = TechnicalIndicatorCalculator.get_signal_score(df, "BREAKOUT", "SELL", self.cfg)
                     if score >= max(base_min + 10, 70): sell_score, used_strategy = score, "BREAKDOWN"
                 elif regime_ltf == "UPTREND":
+                    # Khung lớn giảm, khung nhỏ tăng (Hồi lên) -> Chỉ bán khi có xác nhận
                     score = TechnicalIndicatorCalculator.get_signal_score(df, "PULLBACK", "SELL", self.cfg)
-                    if score >= base_min: sell_score, used_strategy = score, "PULLBACK_SHORT"
+                    last_candle = df.iloc[-1]
+                    body = abs(last_candle["close"] - last_candle["open"])
+                    upper_wick = last_candle["high"] - max(last_candle["open"], last_candle["close"])
+                    is_confirmed = (upper_wick > body * 1.5) or (last_candle["rsi"] > 65)
+                    if score >= base_min and is_confirmed:
+                        sell_score, used_strategy = score, "PULLBACK_SHORT"
 
             elif regime_htf == "RANGING":
                 if regime_ltf == "RANGING":
@@ -659,15 +674,13 @@ class TradingWorker(QThread):
                 return
 
             # ================================================================
-            # ✅ KIỂM TRA REALTIME BẰNG GIÁ THỰC TẾ (SO SÁNH VỚI ENTRY & TP)
+            # ✅ KIỂM TRA REALTIME BẰNG GIÁ THỰC TẾ
             # ================================================================
             try:
-                # 1. Kiểm tra xem giá realtime có đang chạy quá xa so với nến đóng cửa không
                 price_deviation = abs(entry - last_closed_price) / last_closed_price
                 if price_deviation > 0.05:
                     self.log_signal.emit("WARN", f"{symbol}: Giá realtime đã chạy xa ({price_deviation*100:.2f}%). BỎ QUA.")
                     return
-
             except Exception as e:
                 self.log_signal.emit("WARN", f"{symbol}: Lỗi kiểm tra realtime - {e}")
                 return

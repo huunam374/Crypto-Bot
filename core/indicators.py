@@ -61,14 +61,13 @@ class TechnicalIndicatorCalculator:
         cvd_bullish = cvd_slope > 0
         cvd_bearish = cvd_slope < 0
 
-        # 3. Điều kiện Bollinger Mid (Thay vì EMA200)
+        # 3. Điều kiện Bollinger Mid
         bb_mid_slope = 0
         if "bb_mid" in df_htf.columns and len(df_htf) >= 10:
             bb_mid_slope = df_htf["bb_mid"].iloc[-1] - df_htf["bb_mid"].iloc[-10]
         bb_bullish = bb_mid_slope > 0
         bb_bearish = bb_mid_slope < 0
 
-        # Đếm số điều kiện đồng thuận
         bull_count = sum([vwap_bullish, cvd_bullish, bb_bullish])
         bear_count = sum([vwap_bearish, cvd_bearish, bb_bearish])
 
