@@ -509,7 +509,7 @@ class TradingWorker(QThread):
 
         try:
             # ================================================================
-            # LUỒNG 1: QUẢN LÝ LỆNH ĐANG MỞ
+            # LUỒNG 1: QUẢN LÝ LỆNH ĐANG MỞ (TRAILING & CẮT LỖ)
             # ================================================================
             if self.binance.has_open_position(symbol):
                 current_price = self.binance.get_current_price(symbol)
@@ -517,25 +517,85 @@ class TradingWorker(QThread):
                 direction = coin_data.get("direction", "BUY")
                 tp_val = coin_data.get("tp", 0)
                 sl_val = coin_data.get("sl", 0)
+                max_seen = coin_data.get("max_price_seen", current_price)
+                min_seen = coin_data.get("min_price_seen", current_price)
 
                 pnl_data = self.binance.get_position_pnl(symbol, entry_price, 1, direction)
                 with self._lock:
                     self.watchlist[symbol]["last_pnl"] = pnl_data["pnl_usdt"]
+                    # Cập nhật đỉnh/đáy để tính trailing
+                    self.watchlist[symbol]["max_price_seen"] = max(max_seen, current_price)
+                    self.watchlist[symbol]["min_price_seen"] = min(min_seen, current_price)
                     self.update_row_signal.emit(symbol, "Đang giữ lệnh", {
                         "entry": entry_price, "tp": tp_val, "sl": sl_val, "direction": direction,
                         "pnl_usdt": pnl_data["pnl_usdt"], "pnl_pct": pnl_data["pnl_pct"],
                     })
 
+                # ✅ FIX 1: NẾU MẤT SL CỨNG TRÊN SÀN -> ĐẶT LẠI NGAY (CHỈ 1 LẦN)
+                if sl_val <= 0:
+                    risk_pct = 0.025 # 2.5%
+                    new_sl = entry_price * (1 - risk_pct) if direction == "BUY" else entry_price * (1 + risk_pct)
+                    self.log_signal.emit("WARN", f"{symbol}: MẤT SL TRÊN SÀN! Đang tự động đặt lại SL tại {new_sl:.4f}")
+                    try:
+                        # Hủy lệnh TP cũ (nếu có) và đặt lại cặp OCO mới
+                        self.binance.cancel_open_orders(symbol)
+                        self.binance.place_oco_sell(symbol, coin_data.get("qty_bought", 0), tp_val, new_sl, new_sl, direction)
+                        with self._lock:
+                            self.watchlist[symbol]["sl"] = new_sl
+                        sl_val = new_sl # Cập nhật lại biến local để check
+                    except Exception as e:
+                        self.log_signal.emit("ERROR", f"{symbol}: Không thể đặt lại SL: {e}")
+
+                # Kiểm tra chạm SL
                 is_sl_hit = False
                 if direction == "BUY":
-                    if sl_val > 0 and current_price <= sl_val: is_sl_hit = True
+                    if current_price <= sl_val: is_sl_hit = True
                 else:
-                    if sl_val > 0 and current_price >= sl_val: is_sl_hit = True
+                    if current_price >= sl_val: is_sl_hit = True
 
                 if is_sl_hit:
-                    self.log_signal.emit("WARN", f"{symbol}: Chạm SL cứng. Đóng khẩn cấp!")
+                    self.log_signal.emit("WARN", f"{symbol}: Chạm SL. Đóng khẩn cấp!")
                     self._close_position_market(symbol, direction)
                     return
+
+                # ✅ FIX 2: SOFT TRAILING (Cập nhật SL thật trên sàn thay vì đóng lệnh)
+                original_risk = coin_data.get("original_risk", abs(entry_price - sl_val))
+                if original_risk > 0 and tp_val > 0:
+                    if direction == "BUY":
+                        current_rr = (current_price - entry_price) / original_risk
+                    else:
+                        current_rr = (entry_price - current_price) / original_risk
+
+                    # Nếu lời >= 1.0 R -> Bắt đầu trailing
+                    if current_rr >= getattr(self.cfg, 'soft_trailing_activation_rr', 1.0):
+                        if direction == "BUY":
+                            drop_from_peak = (max_seen - current_price) / max_seen
+                            # Nếu rớt quá mức cho phép, dời SL lên sát giá hiện tại để khóa lời
+                            if drop_from_peak >= getattr(self.cfg, 'soft_trailing_drop_pct', 0.01):
+                                new_trailing_sl = current_price * 0.998 # Khóa lời ở mức 99.8% giá hiện tại
+                                if new_trailing_sl > sl_val: # Chỉ dời lên, không dời xuống
+                                    self.log_signal.emit("SUCCESS", f"{symbol}: Trailing mềm! Dời SL lên {new_trailing_sl:.4f}")
+                                    try:
+                                        self.binance.cancel_open_orders(symbol)
+                                        self.binance.place_oco_sell(symbol, coin_data.get("qty_bought", 0), tp_val, new_trailing_sl, new_trailing_sl, direction)
+                                        with self._lock:
+                                            self.watchlist[symbol]["sl"] = new_trailing_sl
+                                    except Exception as e:
+                                        self.log_signal.emit("ERROR", f"{symbol}: Lỗi dời SL Trailing: {e}")
+                        else:
+                            rise_from_trough = (current_price - min_seen) / min_seen
+                            if rise_from_trough >= getattr(self.cfg, 'soft_trailing_drop_pct', 0.01):
+                                new_trailing_sl = current_price * 1.002 # Khóa lời ở mức 100.2% giá hiện tại
+                                if new_trailing_sl < sl_val:
+                                    self.log_signal.emit("SUCCESS", f"{symbol}: Trailing mềm! Dời SL xuống {new_trailing_sl:.4f}")
+                                    try:
+                                        self.binance.cancel_open_orders(symbol)
+                                        self.binance.place_oco_sell(symbol, coin_data.get("qty_bought", 0), tp_val, new_trailing_sl, new_trailing_sl, direction)
+                                        with self._lock:
+                                            self.watchlist[symbol]["sl"] = new_trailing_sl
+                                    except Exception as e:
+                                        self.log_signal.emit("ERROR", f"{symbol}: Lỗi dời SL Trailing: {e}")
+
                 return
 
             # ================================================================
@@ -546,10 +606,7 @@ class TradingWorker(QThread):
                 old_dir = coin_data.get("direction")
                 self.log_signal.emit("WARN", f"{symbol}: Lệnh {old_dir} đã đóng hoàn toàn. Xóa khỏi danh sách.")
                 
-                ok = self.binance.cancel_open_orders(symbol)
-                if not ok:
-                    self.log_signal.emit("ERROR", f"{symbol}: KHÔNG dọn được lệnh mềm! Kiểm tra tay trên sàn.")
-
+                self.binance.cancel_open_orders(symbol)
                 self.trade_closed_signal.emit(symbol, old_dir, {"pnl": final_pnl, "entry": coin_data.get("entry", 0.0)})
                 with self._lock:
                     if symbol in self.watchlist: del self.watchlist[symbol]
@@ -564,7 +621,6 @@ class TradingWorker(QThread):
                     return
                 else:
                     with self._lock: self.watchlist[symbol]["cooldown_until"] = 0
-                    self.log_signal.emit("INFO", f"{symbol}: Hết thời gian nghỉ. Quét lại...")
 
             if self._count_open_positions() >= self.cfg.max_open_positions:
                 return
@@ -591,15 +647,11 @@ class TradingWorker(QThread):
             buy_score, sell_score, used_strategy = 0, 0, ""
             base_min = self.cfg.min_signal_score
 
-            # ================================================================
-            # ✅ LOGIC ĐA KHUNG (MTF MATRIX) - ĐÃ NÂNG CẤP
-            # ================================================================
             if regime_htf == "UPTREND":
                 if regime_ltf == "UPTREND":
                     score = TechnicalIndicatorCalculator.get_signal_score(df, "BREAKOUT", "BUY", self.cfg)
                     if score >= max(base_min + 10, 70): buy_score, used_strategy = score, "BREAKOUT"
                 elif regime_ltf == "DOWNTREND":
-                    # Khung lớn tăng, khung nhỏ giảm (Hồi xuống) -> Chỉ mua khi có xác nhận
                     score = TechnicalIndicatorCalculator.get_signal_score(df, "PULLBACK", "BUY", self.cfg)
                     last_candle = df.iloc[-1]
                     body = abs(last_candle["close"] - last_candle["open"])
@@ -613,7 +665,6 @@ class TradingWorker(QThread):
                     score = TechnicalIndicatorCalculator.get_signal_score(df, "BREAKOUT", "SELL", self.cfg)
                     if score >= max(base_min + 10, 70): sell_score, used_strategy = score, "BREAKDOWN"
                 elif regime_ltf == "UPTREND":
-                    # Khung lớn giảm, khung nhỏ tăng (Hồi lên) -> Chỉ bán khi có xác nhận
                     score = TechnicalIndicatorCalculator.get_signal_score(df, "PULLBACK", "SELL", self.cfg)
                     last_candle = df.iloc[-1]
                     body = abs(last_candle["close"] - last_candle["open"])
@@ -651,9 +702,6 @@ class TradingWorker(QThread):
                 self.remove_coin_signal.emit(self.cfg.market_type, symbol)
                 return
 
-            # ================================================================
-            # ✅ LẤY VỐN VÀ TÍNH SL/TP TRƯỚC KHI KIỂM TRA REALTIME
-            # ================================================================
             final_amount = coin_data.get("manual_amount") or self.cfg.fixed_amount
             current_free = self.binance.get_free_usdt()
             if current_free < 5.0: return
@@ -673,9 +721,6 @@ class TradingWorker(QThread):
                 self.remove_coin_signal.emit(self.cfg.market_type, symbol)
                 return
 
-            # ================================================================
-            # ✅ KIỂM TRA REALTIME BẰNG GIÁ THỰC TẾ
-            # ================================================================
             try:
                 price_deviation = abs(entry - last_closed_price) / last_closed_price
                 if price_deviation > 0.05:
@@ -685,9 +730,6 @@ class TradingWorker(QThread):
                 self.log_signal.emit("WARN", f"{symbol}: Lỗi kiểm tra realtime - {e}")
                 return
 
-            # ================================================================
-            # TIẾN HÀNH ĐẶT LỆNH
-            # ================================================================
             order = self.binance.market_buy_by_quote(symbol, final_amount, direction)
             if not order: return
 
@@ -721,6 +763,7 @@ class TradingWorker(QThread):
                     "tp": plan["take_profit"], "sl": plan["stop_price"], "direction": direction,
                     "original_risk": abs(actual_entry - plan["stop_price"]),
                     "atr": plan.get("atr", actual_entry * 0.02), "qty_bought": qty, "last_pnl": 0.0,
+                    "max_price_seen": actual_entry, "min_price_seen": actual_entry # ✅ BỔ SUNG CHO TRAILING
                 })
                 self.trade_signal.emit(symbol, direction, {
                     "qty": qty, "price": actual_entry, "entry": actual_entry,
@@ -758,7 +801,6 @@ class TradingWorker(QThread):
                 self.log_signal.emit("WARN", f"{symbol}: Lỗi đặt OCO lần {attempt+1}: {e}")
             time.sleep(1)
         return False
-
 
     def _get_actual_qty(self, symbol: str, max_qty: float = None) -> float:
         try:

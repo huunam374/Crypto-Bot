@@ -47,9 +47,9 @@ class Config:
     # =========================================================
     # SL
     sl_atr_mult: float = 2.5
-    sl_min_percent: float = 0.025
-    sl_max_percent: float = 0.10
-    skip_if_sl_over_percent: float = 100
+    sl_min_percent: float = 0.02
+    sl_max_percent: float = 0.4
+    skip_if_sl_over_percent: float = 8.0
 
     # TP cứng (đặt OCO trên sàn)
     min_rr: float = 2.0               # RR tối thiểu — tính toán + có thể skip lệnh
@@ -58,6 +58,10 @@ class Config:
     use_vwap_trend: bool = True       # Bật xác định trend bằng VWAP + CVD (Thay thế EMA200)
     smc_bypass_bb_zone: bool = True   # Cho phép SMC (sweep/FVG) bypass vùng giữa BB
     pullback_vol_min_ratio: float = 0.4  # Ngưỡng volume tối thiểu cho PULLBACK (vol cạn)
+
+    # ✅ MỚI: CẤU HÌNH TRAILING MỀM (SOFT TRAILING)
+    soft_trailing_activation_rr: float = 1.0  # Bắt đầu trailing khi lời 1.0 R
+    soft_trailing_drop_pct: float = 0.02     # Rớt 1.5% từ đỉnh/đáy thì cắt
 
     CONFIG_FILE: ClassVar[Path] = Path("bot_config.json")
 

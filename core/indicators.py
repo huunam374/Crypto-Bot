@@ -81,11 +81,24 @@ class TechnicalIndicatorCalculator:
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
+        # =====================================================================
+        # ✅ FIX LỖI ENA: CHẶN TUYỆT ĐỐI BÁN ĐỈNH / MUA ĐÁY
+        # Không cho phép SELL nếu giá đã vượt BB Upper (Breakout tăng)
+        # Không cho phép BUY nếu giá đã thủng BB Lower (Breakout giảm)
+        # =====================================================================
+        if direction == "SELL":
+            if last["close"] > last["bb_upper"] * 1.002: return 0
+            if last["high"] > last["bb_upper"] * 1.005: return 0
+            if last["rsi"] < 30: return 0 # RSI quá bán thì cấm Short
+        elif direction == "BUY":
+            if last["close"] < last["bb_lower"] * 0.998: return 0
+            if last["low"] < last["bb_lower"] * 0.995: return 0
+            if last["rsi"] > 70: return 0 # RSI quá mua thì cấm Long
+
         enable_smc = cfg.enable_smc if cfg else True
         smc_bypass = getattr(cfg, 'smc_bypass_bb_zone', True) if cfg else True
         pullback_vol_min = getattr(cfg, 'pullback_vol_min_ratio', 0.4) if cfg else 0.4
 
-        # ✅ Khởi tạo tường minh các biến SMC từ đầu
         sweep = "NONE"
         fvg = {"bullish": None, "bearish": None}
         smc_confirms = False
@@ -105,9 +118,6 @@ class TechnicalIndicatorCalculator:
                 atr = last["atr"] if not pd.isna(last["atr"]) else last["close"] * 0.02
                 if fvg_top >= last["close"] >= fvg_bot - (atr * 0.5): smc_confirms = True
 
-        # =====================================================================
-        # ✅ 1. BỘ LỌC HÀNH VI GIÁ NÂNG CAO (ANTI-FOMO + VOLUME + CVD)
-        # =====================================================================
         body_size = abs(last["close"] - last["open"])
         candle_range = last["high"] - last["low"]
         body_ratio = body_size / candle_range if candle_range > 0 else 0
@@ -115,81 +125,54 @@ class TechnicalIndicatorCalculator:
         lower_wick = min(last["open"], last["close"]) - last["low"]
         upper_wick = last["high"] - max(last["open"], last["close"])
 
-        # Lấy Volume và CVD hiện tại (real-time)
         current_vol_ratio = last["vol_ratio"]
-        cvd_slope = last["cvd"] - prev["cvd"]  # Dòng tiền trong 1 nến
+        cvd_slope = last["cvd"] - prev["cvd"]
 
-        # --- LỚP 1 & 2: Chỉ kiểm tra râu khi nến đã "thành hình" (body > 10%) ---
         if body_ratio > 0.1:
-            # Bắt bẫy Bear Trap (Râu dưới dài) - CHẶN CỨNG SELL
             if direction == "SELL" and lower_wick > body_size * 2.0:
-                # Râu dưới dài + Volume cạn kiệt HOẶC CVD đang tăng => Bẫy quét thanh khoản
-                if current_vol_ratio < 0.8 or cvd_slope > 0:
-                    return 0
-                
-            # Bắt bẫy Bull Trap (Râu trên dài) - CHẶN CỨNG BUY
+                if current_vol_ratio < 0.8 or cvd_slope > 0: return 0
             if direction == "BUY" and upper_wick > body_size * 2.0:
-                # Râu trên dài + Volume cạn kiệt HOẶC CVD đang giảm => Bẫy dụ Long
-                if current_vol_ratio < 0.8 or cvd_slope < 0:
-                    return 0
+                if current_vol_ratio < 0.8 or cvd_slope < 0: return 0
 
-        # Chặn đỉnh/đáy Climax (Volume cực to nhưng thân ngắn)
         if last["vol_ratio"] > 3.0 and body_ratio < 0.4:
             if direction == "SELL" and last["rsi"] < 30: return 0
             if direction == "BUY" and last["rsi"] > 70: return 0
 
-        # --- LỚP 3: Trừ điểm nhẹ nếu có dấu hiệu Phân phối/Gom hàng (Không chặn cứng) ---
-        # Giá tăng, Vol lớn nhưng CVD âm => Đang xả hàng (Distribution)
         if direction == "BUY" and last["close"] > last["open"] and cvd_slope < 0 and current_vol_ratio > 1.5:
             score_penalty = 15
-        # Giá giảm, Vol lớn nhưng CVD dương => Đang gom hàng (Accumulation)
         elif direction == "SELL" and last["close"] < last["open"] and cvd_slope > 0 and current_vol_ratio > 1.5:
             score_penalty = 15
         else:
             score_penalty = 0
 
-        # =====================================================================
-        # ✅ 2. BỘ LỌC VOLUME CƠ BẢN
-        # =====================================================================
         vol_min = pullback_vol_min if strategy == "PULLBACK" else 0.8
-        if last["vol_ratio"] < vol_min:
-            return 0
+        if last["vol_ratio"] < vol_min: return 0
 
-        # =====================================================================
-        # ✅ 3. BỘ LỌC BOLLINGER CHUYÊN SÂU (SQUEEZE & WALKING BANDS)
-        # =====================================================================
         bb_range = last["bb_upper"] - last["bb_lower"]
         if bb_range > 0:
             bb_pos = (last["close"] - last["bb_lower"]) / bb_range
             bb_mid = last["bb_mid"]
             atr = last["atr"] if not pd.isna(last["atr"]) else last["close"] * 0.02
             
-            # Chặn FOMO nếu giá quá xa BB Mid (trừ khi là Breakout)
             if abs(last["close"] - bb_mid) > (atr * 3) and strategy != "BREAKOUT":
                 return 0
 
-            # Bollinger Walking (Bám dải)
             is_walking_down = (prev["close"] < prev["bb_lower"]) and (last["close"] < last["bb_lower"])
             is_walking_up = (prev["close"] > prev["bb_upper"]) and (last["close"] > last["bb_upper"])
             
             if direction == "SELL" and is_walking_down and last["vol_ratio"] > 1.5:
-                pass # Cho phép đánh tiếp sóng thần giảm
+                pass
             elif direction == "BUY" and is_walking_up and last["vol_ratio"] > 1.5:
-                pass # Cho phép đánh tiếp sóng thần tăng
+                pass
             elif 0.35 <= bb_pos <= 0.65:
-                # Chỉ chặn nếu KHÔNG PHẢI là chiến lược PULLBACK hoặc BREAKOUT
                 if strategy != "PULLBACK" and strategy != "BREAKOUT":
                     if not (smc_bypass and smc_confirms):
                         return 0
 
-        # =====================================================================
-        # 4. CHẤM ĐIỂM KỸ THUẬT (Tích hợp Squeeze & MFI)
-        # =====================================================================
         score = 0
         dragon_spread = abs(last["ema34"] - last["ema89"]) / last["close"]
         is_squeeze = last["bb_width"] < last["bb_width_ma"] * 0.8 if "bb_width_ma" in last else False
         
-        # Lấy MFI an toàn (tránh lỗi nếu cột chưa tồn tại)
         mfi_curr = last.get("mfi", 50)
         mfi_prev = prev.get("mfi", 50)
 
@@ -201,7 +184,6 @@ class TechnicalIndicatorCalculator:
                 if last["close"] > last["bb_upper"] and body_ratio > 0.7: score += 20
                 if last["vol_ratio"] > 1.5 and body_ratio > 0.6: score += 20
                 if last["obv"] > prev["obv"]: score += 10
-                # ✅ MFI xác nhận dòng tiền tăng
                 if mfi_curr > 50 and mfi_curr > mfi_prev: score += 10
             else:
                 if last["ema34"] < last["ema89"]: score += 15
@@ -210,7 +192,6 @@ class TechnicalIndicatorCalculator:
                 if last["close"] < last["bb_lower"] and body_ratio > 0.7: score += 20
                 if last["vol_ratio"] > 1.5 and body_ratio > 0.6: score += 20
                 if last["obv"] < prev["obv"]: score += 10
-                # ✅ MFI xác nhận dòng tiền giảm
                 if mfi_curr < 50 and mfi_curr < mfi_prev: score += 10
                 
         elif strategy == "PULLBACK":
@@ -220,7 +201,6 @@ class TechnicalIndicatorCalculator:
                 if last["low"] <= last["ema34"] and last["close"] > last["ema34"]: score += 20
                 if last["vol_ratio"] < 1.2: score += 15
                 if last["rsi"] < 45 and last["rsi"] > prev["rsi"]: score += 15
-                # ✅ MFI thoát vùng quá bán
                 if mfi_curr < 40 and mfi_curr > mfi_prev: score += 10
             else:
                 if last["ema34"] < last["ema89"]: score += 15
@@ -228,7 +208,6 @@ class TechnicalIndicatorCalculator:
                 if last["high"] >= last["ema34"] and last["close"] < last["ema34"]: score += 20
                 if last["vol_ratio"] < 1.2: score += 15
                 if last["rsi"] > 55 and last["rsi"] < prev["rsi"]: score += 15
-                # ✅ MFI thoát vùng quá mua
                 if mfi_curr > 60 and mfi_curr < mfi_prev: score += 10
                 
         elif strategy == "RANGING":
@@ -236,18 +215,13 @@ class TechnicalIndicatorCalculator:
                 if last["close"] <= last["bb_lower"] * 1.002: score += 30
                 if last["rsi"] < 30: score += 20
                 if last["clv"] > 0.6 and last["close"] > last["open"]: score += 20
-                # ✅ MFI quá bán và đang quay đầu
                 if mfi_curr < 30 and mfi_curr > mfi_prev: score += 15
             else:
                 if last["close"] >= last["bb_upper"] * 0.998: score += 30
                 if last["rsi"] > 70: score += 20
                 if last["clv"] < -0.6 and last["close"] < last["open"]: score += 20
-                # ✅ MFI quá mua và đang quay đầu
                 if mfi_curr > 70 and mfi_curr < mfi_prev: score += 15
 
-        # =====================================================================
-        # 5. SMC BONUS (Đã nâng cấp: Có điều kiện RSI để tránh bắt đỉnh/đáy)
-        # =====================================================================
         if enable_smc:
             sweep_bonus = cfg.smc_sweep_bonus if cfg else 15
             if direction == "BUY" and sweep == "BULLISH" and last["rsi"] > 30: 
@@ -271,10 +245,8 @@ class TechnicalIndicatorCalculator:
             if 0.35 <= bb_pos <= 0.65 and strategy != "BREAKOUT" and smc_confirms:
                 score -= 10
 
-        # ✅ ÁP DỤNG HÌNH PHẠT (PENALTY) TỪ BỘ LỌC CVD
         score -= score_penalty
-
-        return max(0, score)  # Đảm bảo điểm không bao giờ âm
+        return max(0, score)
 
     @staticmethod
     def check_fvg(df: pd.DataFrame, lookback: int = 20) -> dict:
